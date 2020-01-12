@@ -1,0 +1,76 @@
+//Config file to define Hardware Pins LPC Boards.
+//Note: Each line should be less than 120 characters.
+//    : Unwanted options can be commented out or set to NoPin. Lines commented out will get default values
+//    : for pins the default is NoPin.
+//    : Values for Arrays need to be contained within { and }
+//    : Comments can be defined with // or # (comments are not supported inside arrays)
+//    : Each config entry must be all on a single line.
+
+//SKR v1.4 
+
+//                      Drive        0     1     2     3     4 
+//                    Typically      X     Y     Z     E0    E1
+stepper.enablePins =               {2.1, 2.8,  0.21, 2.12, 1.16};
+stepper.stepPins =                 {2.2, 0.19, 0.22, 2.13, 1.15};    
+stepper.directionPins =            {2.6, 0.20, 2.11, 0.11, 1.14};
+stepper.TmcUartPins =              {1.10, 1.9, 1.8, 1.4, 1.1}
+stepper.hasDriverCurrentControl = false; 
+
+
+//RRF equiv     X     Y     Z     E0    E1
+//RRF C Index   0     1     2     3     4
+endstop.pins = {1.29, 1.28, 1.27, 1.26, 1.25}; //X, Y, Z, E0, E1 Endstops
+
+//                    Bed   E0    E1
+heat.tempSensePins = {0.25, 0.24, 0.23}; //tb, th0, th1
+heat.heatOnPins =    {2.5, 2.7, 2.4}; //hbed, he0, he1
+
+// Z Probe pin
+// Probe pin can be NoPin and select from an "EndStop Pin" (which are digital input)
+// using the C parameter of M558. 
+// Note: Expected to be an ADC pin for certain modes, if needed then a spare A/D capable pin
+// should be used and set zProbe.pin below. Beware that pins configured for ADC are **NOT** 5V tolerant
+zProbe.pin = 0.10;
+zProbe.modulationPin = NoPin
+
+// Fan PWM pins. If not assigned pin does not support HWPwm, or HWPWM not running at desired fan RPM, 
+// then also add to Timers array below
+// Current maximum of 2 fans supported
+fan.pins = {2.3}; //cooling fan
+
+lpc.slowPWM.pins = {2.5}; 
+lpc.slowPWM.frequencyHz = 10; //10Hz (for Bed PWM)
+lpc.fastPWM.pins = {2.7, 2.4};
+lpc.fastPWM.frequencyHz = 250; //250Hz (for Hotend/Fan PWM)
+
+lpc.servoPins = {2.0};
+specialPinMap = {2.0};
+
+//Only supports 1 External SDCard
+//externalSDCard.csPin         = 0.16;
+//externalSDCard.cardDetectPin = 1.31;
+
+//lpc.externalSDCard.spiFrequencyHz  = 4000000;
+//lpc.externalSDCard.spiChannel = 0; 
+
+
+
+
+
+//LCD Pins (only ST9720 SPI currently supported)
+
+//setup the Software SPI Pins for LCD
+lpc.softwareSPI.pins = {1.20, NoPin, 1.18}; //Set to GPIO pins to use as SCK, MISO, MOSI
+
+lcd.spiChannel = 2; //2 = SWSPI - Use Software SPI Channel
+lcd.lcdCSPin =       1.19; //LCD Chip Select
+lcd.lcdBeepPin =     1.30;
+lcd.encoderPinA =    3.26;
+lcd.encoderPinB =    3.25;
+lcd.encoderPinSw =   0.28; //click
+lcd.lcdDCPin =       NoPin;  //DataControl Pin (A0) if none used set to NoPin
+lcd.panelButtonPin = NoPin; 
+8266wifi.EspDataReadyPin = 0.1
+8266wifi.LpcTfrReadyPin = 0.0
+8266wifi.EspResetPin = 1.31
+

@@ -15,8 +15,10 @@
 #include "Movement/StepTimer.h"
 #include "Hardware/Cache.h"
 
+#if !LPC_TMC_SOFT_UART
 #include "sam/drivers/pdc/pdc.h"
 #include "sam/drivers/uart/uart.h"
+#endif
 
 // Important note:
 // The TMC2224 does handle a write request immediately followed by a read request.
@@ -236,6 +238,8 @@ static constexpr uint8_t InitialSendCRC = CRCAddByte(CRCAddByte(0, 0x05), 0x00);
 // CRC of a request to read the IFCOUNT register
 static constexpr uint8_t ReadIfcountCRC = CRCAddByte(InitialSendCRC, REGNUM_IFCOUNT);
 
+
+
 //----------------------------------------------------------------------------------------------------------------------------------
 // Private types and methods
 
@@ -287,7 +291,7 @@ private:
 #if TMC22xx_HAS_MUX
 	void SetUartMux() noexcept;
 	static void SetupDMASend(uint8_t regnum, uint32_t outVal, uint8_t crc) noexcept __attribute__ ((hot));	// set up the PDC to send a register
-	static void SetupDMAReceive(uint8_t regnum, uint8_t crc) noexcept __attribute__ ((hot));					// set up the PDC to receive a register
+	static void SetupDMAReceive(uint8_t regnum, uint8_t crc) noexcept __attribute__ ((hot));				// set up the PDC to receive a register
 #else
 	void SetupDMASend(uint8_t regnum, uint32_t outVal, uint8_t crc) noexcept __attribute__ ((hot));			// set up the PDC to send a register
 	void SetupDMAReceive(uint8_t regnum, uint8_t crc) noexcept __attribute__ ((hot));						// set up the PDC to receive a register
@@ -325,8 +329,9 @@ private:
 	uint32_t microstepShiftFactor;							// how much we need to shift 1 left by to get the current microstepping
 	uint32_t motorCurrent;									// the configured motor current
 	uint32_t maxOpenLoadStepInterval;						// the maximum step pulse interval for which we consider open load detection to be reliable
+#if LPC_TMC_SOFT_UART
 
-#if TMC22xx_HAS_MUX
+#elif TMC22xx_HAS_MUX
 	static Uart * const uart;								// the UART that controls all drivers
 #else
 	Uart *uart;												// the UART that controls this driver
@@ -340,6 +345,7 @@ private:
 	static volatile uint8_t receiveData[20];
 
 	uint16_t readErrors;									// how many read errors we had
+	uint16_t crcErrors;
 	uint16_t writeErrors;									// how many write errors we had
 	uint16_t numReads;										// how many successful reads we had
 	uint16_t numTimeouts;									// how many times a transfer timed out
@@ -362,6 +368,187 @@ Uart * const TmcDriverState::uart = UART_TMC22xx;
 
 TmcDriverState * volatile TmcDriverState::currentDriver = nullptr;	// volatile because the ISR changes it
 uint32_t TmcDriverState::transferStartedTime;
+
+// Soft UART implementation
+#if LPC_TMC_SOFT_UART
+constexpr uint32_t SU_BAUD_RATE = DriversBaudRate;
+constexpr uint32_t SU_OVERSAMPLE = 3;
+static uint32_t SUPeriod;
+static volatile uint32_t SUWriteCnt = 0;
+static volatile uint32_t SUReadCnt = 0;
+static volatile uint8_t *SUWritePtr;
+static volatile uint8_t *SUReadPtr;
+static volatile int SUBitCnt;
+static volatile uint32_t SUData;
+static volatile uint32_t SUTickCnt;
+static volatile Pin SUPin;
+static volatile uint8_t SUComplete;
+static LPC_GPIO_T *SUPort;
+static uint8_t SUPinNo;
+
+
+extern "C" void RIT_IRQHandler() noexcept __attribute__ ((hot));
+
+void RIT_IRQHandler() noexcept
+{
+	digitalWrite(P3_25, 1);
+	Chip_RIT_ClearInt(LPC_RITIMER);
+	if (--SUTickCnt > 0)
+	{
+		digitalWrite(P3_25, 0);
+		return;
+	}
+
+	if (SUWriteCnt > 0)
+	{
+    	if (SUBitCnt++ < 10 ) 
+		{
+			// send data 
+			//digitalWrite(SUPin, SUData & 1);
+			util_UpdateBit(SUPort->PIN, SUPinNo, SUData & 1);
+			SUData >>= 1;
+			SUTickCnt = SU_OVERSAMPLE;
+    	}
+    	else if (--SUWriteCnt > 0)
+		{
+			// send start bit
+			//digitalWrite(SUPin, 0);
+			util_UpdateBit(SUPort->PIN, SUPinNo, 0);
+			// get data and add stop bit (but not start bit)
+			SUData = 0x100 | *SUWritePtr++;
+			// Start bit has already been sent
+			SUBitCnt = 1;
+			SUTickCnt = SU_OVERSAMPLE;
+		}
+		else
+		{
+			// end of output, switch to input mode
+			//pinMode(SUPin, INPUT_PULLUP);
+			util_UpdateBit(SUPort->DIR, SUPinNo, 0);
+			SUBitCnt = -1;
+			SUTickCnt = 1;
+			SUWriteCnt = 0;
+		}
+	}
+	else if (SUReadCnt > 0)
+	{
+    	//uint8_t inbit = digitalRead(SUPin);
+		uint8_t inbit = util_IsBitSet(SUPort->PIN, SUPinNo);
+    	if (SUBitCnt == -1) 
+		{
+      		// waiting for start bit
+      		if (!inbit) 
+			{
+        		// got start bit
+        		SUBitCnt = 0;
+        		SUTickCnt = SU_OVERSAMPLE+1;
+        		SUData = 0;
+      		}
+      		else
+        		SUTickCnt = 1;
+    	}
+    	else if (SUBitCnt >= 8) 
+		{
+			// stop bit read, add data to buffer
+			*SUReadPtr++ =  static_cast<uint8_t>(SUData);
+			SUTickCnt = 1;
+      		SUBitCnt = -1;
+			if (--SUReadCnt <= 0)
+			{
+				SUComplete = 1;
+			}
+		}
+    	else 
+		{
+      		// data bits
+      		SUData >>= 1;
+      		if (inbit)
+        		SUData |= 0x80;
+      		SUBitCnt++;
+      		SUTickCnt = SU_OVERSAMPLE;
+		}
+    }
+	digitalWrite(P3_25, 0);
+}
+
+
+
+static void LPCSoftUARTAbort() noexcept
+{
+	SUReadCnt = 0;
+	SUWriteCnt = 0;
+	SUComplete = 0;
+	if (SUPin != NoPin)
+		pinMode(SUPin, INPUT_PULLUP);
+}
+
+static void LPCSoftUARTStartTransfer(uint8_t driver, volatile uint8_t *WritePtr, uint32_t WriteCnt, volatile uint8_t *ReadPtr, uint32_t ReadCnt) noexcept
+{
+	LPCSoftUARTAbort();
+	SUWritePtr = WritePtr;
+	SUReadPtr = ReadPtr;
+	// Add start and stop bits to first byte
+	SUData = (static_cast<uint32_t>(*SUWritePtr) << 1) | 0x200;
+	SUWritePtr++;
+	SUBitCnt = 0;
+	SUTickCnt = 1;
+	SUPin = TMC_UART_PINS[driver];
+	if (SUPin != NoPin)
+	{
+		pinMode(SUPin, OUTPUT_HIGH);
+		SUPort = (LPC_GPIO_T*)(LPC_GPIO0_BASE + ((SUPin) & ~0x1f));
+		SUPinNo = SUPin & 0x1f;
+		SUWriteCnt = WriteCnt;
+		SUReadCnt = ReadCnt;
+	}
+}
+
+
+static void LPCSoftUARTCheckComplete() noexcept
+{
+	if (SUComplete)
+	{
+		SUComplete = 0;
+		// I/O complete
+		TmcDriverState *driver = TmcDriverState::currentDriver;	// capture volatile variable
+		if (driver != nullptr)
+		{
+			driver->UartTmcHandler();
+		}
+	}
+}
+
+static void LPCSoftUARTInit() noexcept
+{
+	LPCSoftUARTAbort();
+
+	Chip_RIT_Init(LPC_RITIMER);
+	//Chip_RIT_SetCOMPVAL(LPC_RITIMER, Chip_Clock_GetPeripheralClockRate(SYSCTL_PCLK_RIT)/(SU_BAUD_RATE*SU_OVERSAMPLE));
+	SUPeriod = Chip_Clock_GetPeripheralClockRate(SYSCTL_PCLK_RIT)/(SU_BAUD_RATE*SU_OVERSAMPLE);
+	Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
+
+	Chip_RIT_EnableCTRL(LPC_RITIMER, RIT_CTRL_ENCLR);
+	Chip_RIT_Enable(LPC_RITIMER);
+	for(size_t i = 0; i < NumDirectDrivers; i++)
+		if (TMC_UART_PINS[i] != NoPin)
+			pinMode(TMC_UART_PINS[i], INPUT_PULLUP);
+
+	NVIC_EnableIRQ(RITIMER_IRQn);
+
+	pinMode(P3_25, OUTPUT_LOW);
+}
+
+
+static void LPCSoftUARTShutdown() noexcept
+{
+	LPCSoftUARTAbort();
+	Chip_RIT_Disable(LPC_RITIMER);
+	NVIC_DisableIRQ(RITIMER_IRQn);
+}
+
+
+
+#endif
 
 // To write a register, we send one 8-byte packet to write it, then a 4-byte packet to ask for the IFCOUNT register, then we receive an 8-byte packet containing IFCOUNT.
 // This is the message we send - volatile because we care about when it is written
@@ -408,12 +595,15 @@ const uint8_t TmcDriverState::ReadRegCRCs[NumReadRegisters] =
 // State structures for all drivers
 static TmcDriverState driverStates[MaxSmartDrivers];
 
+
 // Set up the PDC to send a register
 inline void TmcDriverState::SetupDMASend(uint8_t regNum, uint32_t regVal, uint8_t crc) noexcept
 {
+#if !LPC_TMC_SOFT_UART
 	// Faster code, not using the ASF
 	Pdc * const pdc = uart_get_pdc_base(uart);
 	pdc->PERIPH_PTCR = (PERIPH_PTCR_RXTDIS | PERIPH_PTCR_TXTDIS);	// disable the PDC
+#endif
 
 	sendData[2] = regNum | 0x80;
 	sendData[3] = (uint8_t)(regVal >> 24);
@@ -421,7 +611,9 @@ inline void TmcDriverState::SetupDMASend(uint8_t regNum, uint32_t regVal, uint8_
 	sendData[5] = (uint8_t)(regVal >> 8);
 	sendData[6] = (uint8_t)regVal;
 	sendData[7] = crc;
-
+#if LPC_TMC_SOFT_UART
+	LPCSoftUARTStartTransfer(driverNumber, sendData, 12, receiveData + 12, 8);
+#else
 	Cache::FlushBeforeDMASend(sendData, sizeof(sendData));
 	Cache::FlushBeforeDMAReceive(receiveData, sizeof(receiveData));
 
@@ -432,18 +624,24 @@ inline void TmcDriverState::SetupDMASend(uint8_t regNum, uint32_t regVal, uint8_
 	pdc->PERIPH_RCR = 20;											// number of bytes to receive: the sent data + 8 bytes of received data
 
 	pdc->PERIPH_PTCR = (PERIPH_PTCR_RXTEN | PERIPH_PTCR_TXTEN);		// enable the PDC to transmit and receive
+#endif
 }
 
 // Set up the PDC to send a register and receive the status
 inline void TmcDriverState::SetupDMAReceive(uint8_t regNum, uint8_t crc) noexcept
 {
+#if !LPC_TMC_SOFT_UART
 	// Faster code, not using the ASF
 	Pdc * const pdc = uart_get_pdc_base(uart);
 	pdc->PERIPH_PTCR = (PERIPH_PTCR_RXTDIS | PERIPH_PTCR_TXTDIS);	// disable the PDC
+#endif
 
 	sendData[2] = regNum;
 	sendData[3] = crc;
 
+#if LPC_TMC_SOFT_UART
+	LPCSoftUARTStartTransfer(driverNumber, sendData, 4, receiveData + 4, 8);
+#else
 	Cache::FlushBeforeDMASend(sendData, sizeof(sendData));
 	Cache::FlushBeforeDMAReceive(receiveData, sizeof(receiveData));
 
@@ -454,7 +652,9 @@ inline void TmcDriverState::SetupDMAReceive(uint8_t regNum, uint8_t crc) noexcep
 	pdc->PERIPH_RCR = 12;											// receive the 4 bytes we sent + 8 bytes of received data
 
 	pdc->PERIPH_PTCR = (PERIPH_PTCR_RXTEN | PERIPH_PTCR_TXTEN);		// enable the PDC to transmit and receive
+#endif
 }
+
 
 // Update the maximum step pulse interval at wich we consider open load detection to be reliable
 void TmcDriverState::UpdateMaxOpenLoadStepInterval() noexcept
@@ -517,7 +717,7 @@ pre(!driversPowered)
 		pinMode(p_pin, OUTPUT_HIGH);
 	}
 
-#if !TMC22xx_HAS_MUX
+#if !TMC22xx_HAS_MUX && !LPC_TMC_SOFT_UART
 	uart = TMC22xxUarts[p_driverNumber];
 #endif
 
@@ -540,6 +740,7 @@ pre(!driversPowered)
 	registerToRead = 0;
 	lastIfCount = 0;
 	readErrors = writeErrors = numReads = numTimeouts = 0;
+	crcErrors = 0;
 }
 
 inline void TmcDriverState::SetAxisNumber(size_t p_axisNumber) noexcept
@@ -777,10 +978,29 @@ void TmcDriverState::AppendDriverStatus(const StringRef& reply) noexcept
 	{
 		reply.cat(" ok");
 	}
-
+	reply.catf( ", CRC errors %u", crcErrors);
 	reply.catf(", read errors %u, write errors %u, ifcount %u, reads %u, timeouts %u", readErrors, writeErrors, lastIfCount, numReads, numTimeouts);
 	readErrors = writeErrors = numReads = numTimeouts = 0;
+	crcErrors = 0;
 }
+
+uint8_t static calcCRC(volatile uint8_t *datagram, uint8_t len) {
+	uint8_t crc = 0;
+	for (uint8_t i = 0; i < len; i++) {
+		uint8_t currentByte = datagram[i];
+		for (uint8_t j = 0; j < 8; j++) {
+			if ((crc >> 7) ^ (currentByte & 0x01)) {
+				crc = (crc << 1) ^ 0x07;
+			} else {
+				crc = (crc << 1);
+			}
+			crc &= 0xff;
+			currentByte = currentByte >> 1;
+		}
+	}
+	return crc;
+}
+
 
 // This is called by the ISR when the SPI transfer has completed
 inline void TmcDriverState::TransferDone() noexcept
@@ -803,6 +1023,8 @@ inline void TmcDriverState::TransferDone() noexcept
 	{
 		if (sendData[2] == ReadRegNumbers[registerToRead] && ReadRegNumbers[registerToRead] == receiveData[6] && receiveData[4] == 0x05 && receiveData[5] == 0xFF)
 		{
+			if (calcCRC(receiveData+4, 7) != receiveData[11])
+				crcErrors++;
 			// We asked to read the scheduled read register, and the sync byte, slave address and register number in the received message match
 			//TODO here we could check the CRC of the received message, but for now we assume that we won't get any corruption in the 32-bit received data
 			uint32_t regVal = ((uint32_t)receiveData[7] << 24) | ((uint32_t)receiveData[8] << 16) | ((uint32_t)receiveData[9] << 8) | receiveData[10];
@@ -838,9 +1060,13 @@ inline void TmcDriverState::TransferDone() noexcept
 // This is called to abandon the current transfer, if any
 void TmcDriverState::AbortTransfer() noexcept
 {
+#if LPC_TMC_SOFT_UART
+	LPCSoftUARTAbort();
+#else
 	uart->UART_IDR = UART_IDR_ENDRX;				// disable end-of-receive interrupt
 	uart_get_pdc_base(uart)->PERIPH_PTCR = (PERIPH_PTCR_RXTDIS | PERIPH_PTCR_TXTDIS);	// disable the PDC
 	uart->UART_CR = UART_CR_RSTRX | UART_CR_RSTTX | UART_CR_RXDIS | UART_CR_TXDIS | UART_CR_RSTSTA;
+#endif
 }
 
 #if TMC22xx_HAS_MUX
@@ -892,10 +1118,14 @@ inline void TmcDriverState::StartTransfer() noexcept
 
 		// Read a register
 		const irqflags_t flags = cpu_irq_save();		// avoid race condition
+#if LPC_TMC_SOFT_UART
+		SetupDMAReceive(ReadRegNumbers[registerToRead], ReadRegCRCs[registerToRead]);	// set up the PDC
+#else
 		uart->UART_CR = UART_CR_RSTRX | UART_CR_RSTTX;	// reset transmitter and receiver
 		SetupDMAReceive(ReadRegNumbers[registerToRead], ReadRegCRCs[registerToRead]);	// set up the PDC
 		uart->UART_IER = UART_IER_ENDRX;				// enable end-of-receive interrupt
 		uart->UART_CR = UART_CR_RXEN | UART_CR_TXEN;	// enable transmitter and receiver
+#endif
 		transferStartedTime = millis();
 		cpu_irq_restore(flags);
 	}
@@ -907,10 +1137,14 @@ inline void TmcDriverState::StartTransfer() noexcept
 		// Kick off a transfer for that register
 		const irqflags_t flags = cpu_irq_save();		// avoid race condition
 		registerBeingUpdated = 1u << regNum;
+#if LPC_TMC_SOFT_UART
+		SetupDMASend(WriteRegNumbers[regNum], writeRegisters[regNum], writeRegCRCs[regNum]);	// set up the PDC
+#else
 		uart->UART_CR = UART_CR_RSTRX | UART_CR_RSTTX;	// reset transmitter and receiver
 		SetupDMASend(WriteRegNumbers[regNum], writeRegisters[regNum], writeRegCRCs[regNum]);	// set up the PDC
 		uart->UART_IER = UART_IER_ENDRX;				// enable end-of-transfer interrupt
 		uart->UART_CR = UART_CR_RXEN | UART_CR_TXEN;	// enable transmitter and receiver
+#endif
 		transferStartedTime = millis();
 		cpu_irq_restore(flags);
 	}
@@ -920,7 +1154,9 @@ inline void TmcDriverState::StartTransfer() noexcept
 
 inline void TmcDriverState::UartTmcHandler() noexcept
 {
+#if !LPC_TMC_SOFT_UART
 	uart->UART_IDR = UART_IDR_ENDRX;					// disable the PDC interrupt
+#endif
 	TransferDone();										// tidy up after the transfer we just completed
 	if (driversState != DriversState::noPower)
 	{
@@ -958,7 +1194,7 @@ void TMC22xx_UART_Handler() noexcept
 	}
 }
 
-#else
+#elif !LPC_TMC_SOFT_UART
 
 // ISRs for the individual UARTs
 extern "C" void UART_TMC_DRV0_Handler() noexcept __attribute__ ((hot));
@@ -986,9 +1222,9 @@ namespace SmartDrivers
 		numTmc22xxDrivers = min<size_t>(numTmcDrivers, MaxSmartDrivers);
 
 		// Make sure the ENN pins are high
-		pinMode(GlobalTmc22xxEnablePin, OUTPUT_HIGH);
-
-#if TMC22xx_HAS_MUX
+#if LPC_TMC_SOFT_UART
+		LPCSoftUARTInit();
+#elif TMC22xx_HAS_MUX
 		// Set up- the single UART that communicates with all TMC22xx drivers
 		ConfigurePin(TMC22xx_UART_PINS);									// the pins are already set up for UART use in the pins table
 
@@ -1012,7 +1248,7 @@ namespace SmartDrivers
 		driversState = DriversState::noPower;
 		for (size_t drive = 0; drive < numTmc22xxDrivers; ++drive)
 		{
-#if !TMC22xx_HAS_MUX
+#if !TMC22xx_HAS_MUX && !LPC_TMC_SOFT_UART
 			// Initialise the UART that controls this driver
 			// The pins are already set up for UART use in the pins table
 			ConfigurePin(TMC22xxUartPins[drive]);
@@ -1036,8 +1272,11 @@ namespace SmartDrivers
 	// Shut down the drivers and stop any related interrupts. Don't call Spin() again after calling this as it may re-enable them.
 	void Exit() noexcept
 	{
-		pinMode(GlobalTmc22xxEnablePin, OUTPUT_HIGH);
-#if TMC22xx_HAS_MUX
+		if (GlobalTmc22xxEnablePin != NoPin)
+			pinMode(GlobalTmc22xxEnablePin, OUTPUT_HIGH);
+#if LPC_TMC_SOFT_UART
+		LPCSoftUARTShutdown();
+#elif TMC22xx_HAS_MUX
 		NVIC_DisableIRQ(TMC22xx_UART_IRQn);
 #else
 		for (size_t drive = 0; drive < numTmc22xxDrivers; ++drive)
@@ -1129,6 +1368,9 @@ namespace SmartDrivers
 	// Before the first call to this function with 'powered' true, you must call Init()
 	void Spin(bool powered) noexcept
 	{
+	#if LPC_TMC_SOFT_UART
+		LPCSoftUARTCheckComplete();
+	#endif
 		if (driversState == DriversState::noPower)
 		{
 			if (powered)
@@ -1185,7 +1427,8 @@ namespace SmartDrivers
 
 				if (allInitialised)
 				{
-					digitalWrite(GlobalTmc22xxEnablePin, LOW);
+					if (GlobalTmc22xxEnablePin != NoPin)
+						digitalWrite(GlobalTmc22xxEnablePin, LOW);
 					driversState = DriversState::ready;
 				}
 			}
@@ -1193,7 +1436,8 @@ namespace SmartDrivers
 		else
 		{
 			// We had power but we lost it
-			digitalWrite(GlobalTmc22xxEnablePin, HIGH);			// disable the drivers
+			if (GlobalTmc22xxEnablePin != NoPin)
+				digitalWrite(GlobalTmc22xxEnablePin, HIGH);			// disable the drivers
 			if (TmcDriverState::currentDriver == nullptr)
 			{
 				TmcDriverState::currentDriver->AbortTransfer();

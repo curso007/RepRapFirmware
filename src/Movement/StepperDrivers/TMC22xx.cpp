@@ -372,7 +372,7 @@ uint32_t TmcDriverState::transferStartedTime;
 // Soft UART implementation
 #if LPC_TMC_SOFT_UART
 constexpr uint32_t SU_BAUD_RATE = DriversBaudRate;
-constexpr uint32_t SU_OVERSAMPLE = 3;
+constexpr uint32_t SU_OVERSAMPLE = 4;
 static uint32_t SUPeriod;
 static volatile uint32_t SUWriteCnt = 0;
 static volatile uint32_t SUReadCnt = 0;
@@ -380,7 +380,6 @@ static volatile uint8_t *SUWritePtr;
 static volatile uint8_t *SUReadPtr;
 static volatile int SUBitCnt;
 static volatile uint32_t SUData;
-static volatile uint32_t SUTickCnt;
 static volatile Pin SUPin;
 static volatile uint8_t SUComplete;
 static LPC_GPIO_T *SUPort;
@@ -393,12 +392,6 @@ void RIT_IRQHandler() noexcept
 {
 	digitalWrite(P3_25, 1);
 	Chip_RIT_ClearInt(LPC_RITIMER);
-	if (--SUTickCnt > 0)
-	{
-		digitalWrite(P3_25, 0);
-		return;
-	}
-
 	if (SUWriteCnt > 0)
 	{
     	if (SUBitCnt++ < 10 ) 
@@ -407,7 +400,6 @@ void RIT_IRQHandler() noexcept
 			//digitalWrite(SUPin, SUData & 1);
 			util_UpdateBit(SUPort->PIN, SUPinNo, SUData & 1);
 			SUData >>= 1;
-			SUTickCnt = SU_OVERSAMPLE;
     	}
     	else if (--SUWriteCnt > 0)
 		{
@@ -418,15 +410,14 @@ void RIT_IRQHandler() noexcept
 			SUData = 0x100 | *SUWritePtr++;
 			// Start bit has already been sent
 			SUBitCnt = 1;
-			SUTickCnt = SU_OVERSAMPLE;
 		}
 		else
 		{
 			// end of output, switch to input mode
 			//pinMode(SUPin, INPUT_PULLUP);
 			util_UpdateBit(SUPort->DIR, SUPinNo, 0);
-			SUBitCnt = -1;
-			SUTickCnt = 1;
+			Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod/SU_OVERSAMPLE);
+			SUBitCnt = -2;
 			SUWriteCnt = 0;
 		}
 	}
@@ -434,25 +425,31 @@ void RIT_IRQHandler() noexcept
 	{
     	//uint8_t inbit = digitalRead(SUPin);
 		uint8_t inbit = util_IsBitSet(SUPort->PIN, SUPinNo);
-    	if (SUBitCnt == -1) 
+    	if (SUBitCnt < 0) 
 		{
       		// waiting for start bit
       		if (!inbit) 
 			{
         		// got start bit
-        		SUBitCnt = 0;
-        		SUTickCnt = SU_OVERSAMPLE+1;
-        		SUData = 0;
+				if (++SUBitCnt >= 0)
+				{
+					Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
+        			SUBitCnt = 0;
+        			SUData = 0;
+				}
       		}
-      		else
-        		SUTickCnt = 1;
+			else
+			{
+				SUBitCnt = -2;
+			}
+			
     	}
     	else if (SUBitCnt >= 8) 
 		{
 			// stop bit read, add data to buffer
 			*SUReadPtr++ =  static_cast<uint8_t>(SUData);
-			SUTickCnt = 1;
-      		SUBitCnt = -1;
+			Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod/SU_OVERSAMPLE);
+      		SUBitCnt = -2;
 			if (--SUReadCnt <= 0)
 			{
 				SUComplete = 1;
@@ -465,7 +462,6 @@ void RIT_IRQHandler() noexcept
       		if (inbit)
         		SUData |= 0x80;
       		SUBitCnt++;
-      		SUTickCnt = SU_OVERSAMPLE;
 		}
     }
 	digitalWrite(P3_25, 0);
@@ -485,13 +481,13 @@ static void LPCSoftUARTAbort() noexcept
 static void LPCSoftUARTStartTransfer(uint8_t driver, volatile uint8_t *WritePtr, uint32_t WriteCnt, volatile uint8_t *ReadPtr, uint32_t ReadCnt) noexcept
 {
 	LPCSoftUARTAbort();
+	Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
 	SUWritePtr = WritePtr;
 	SUReadPtr = ReadPtr;
 	// Add start and stop bits to first byte
 	SUData = (static_cast<uint32_t>(*SUWritePtr) << 1) | 0x200;
 	SUWritePtr++;
 	SUBitCnt = 0;
-	SUTickCnt = 1;
 	SUPin = TMC_UART_PINS[driver];
 	if (SUPin != NoPin)
 	{
@@ -524,7 +520,7 @@ static void LPCSoftUARTInit() noexcept
 
 	Chip_RIT_Init(LPC_RITIMER);
 	//Chip_RIT_SetCOMPVAL(LPC_RITIMER, Chip_Clock_GetPeripheralClockRate(SYSCTL_PCLK_RIT)/(SU_BAUD_RATE*SU_OVERSAMPLE));
-	SUPeriod = Chip_Clock_GetPeripheralClockRate(SYSCTL_PCLK_RIT)/(SU_BAUD_RATE*SU_OVERSAMPLE);
+	SUPeriod = Chip_Clock_GetPeripheralClockRate(SYSCTL_PCLK_RIT)/(SU_BAUD_RATE);
 	Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
 
 	Chip_RIT_EnableCTRL(LPC_RITIMER, RIT_CTRL_ENCLR);

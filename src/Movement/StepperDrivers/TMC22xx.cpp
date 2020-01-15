@@ -372,7 +372,7 @@ uint32_t TmcDriverState::transferStartedTime;
 // Soft UART implementation
 #if LPC_TMC_SOFT_UART
 constexpr uint32_t SU_BAUD_RATE = DriversBaudRate;
-constexpr uint32_t SU_OVERSAMPLE = 4;
+constexpr uint32_t SU_OVERSAMPLE = 3;
 static uint32_t SUPeriod;
 static volatile uint32_t SUWriteCnt = 0;
 static volatile uint32_t SUReadCnt = 0;
@@ -384,13 +384,20 @@ static volatile Pin SUPin;
 static volatile uint8_t SUComplete;
 static LPC_GPIO_T *SUPort;
 static uint8_t SUPinNo;
+static uint8_t SUSync;
+static volatile int SUOffset;
+static volatile int SUBaseOffset;
+static volatile int SUBaseOffset2;
+static volatile uint32_t SUErrors = 0;
+
+
 
 
 extern "C" void RIT_IRQHandler() noexcept __attribute__ ((hot));
 
 void RIT_IRQHandler() noexcept
 {
-	digitalWrite(P3_25, 1);
+	//digitalWrite(P3_25, 1);
 	Chip_RIT_ClearInt(LPC_RITIMER);
 	if (SUWriteCnt > 0)
 	{
@@ -399,7 +406,27 @@ void RIT_IRQHandler() noexcept
 			// send data 
 			//digitalWrite(SUPin, SUData & 1);
 			util_UpdateBit(SUPort->PIN, SUPinNo, SUData & 1);
+			int offset = Chip_RIT_GetCounter(LPC_RITIMER);
 			SUData >>= 1;
+			if (SUSync)
+			{
+				if (SUBitCnt == 1)
+					SUBaseOffset = offset;
+				else if (SUBitCnt == 5)
+				{
+					SUBaseOffset2 = offset;
+					SUOffset = (offset - SUBaseOffset)/4;
+					SUSync = 0;
+					if (SUOffset > (int)SUPeriod/4 || SUOffset < -((int)SUPeriod/4) ||
+						(SUPeriod + SUOffset) < (Chip_RIT_GetCounter(LPC_RITIMER) + 200) )
+					{
+						SUOffset = 0;
+						SUErrors++;
+						SUWriteCnt = SUReadCnt = 0;
+					}
+					Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod + SUOffset);
+				}
+			}
     	}
     	else if (--SUWriteCnt > 0)
 		{
@@ -416,8 +443,8 @@ void RIT_IRQHandler() noexcept
 			// end of output, switch to input mode
 			//pinMode(SUPin, INPUT_PULLUP);
 			util_UpdateBit(SUPort->DIR, SUPinNo, 0);
-			Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod/SU_OVERSAMPLE);
-			SUBitCnt = -2;
+			Chip_RIT_SetCOMPVAL(LPC_RITIMER, (SUPeriod + SUOffset)*8);
+			SUBitCnt = -1;
 			SUWriteCnt = 0;
 		}
 	}
@@ -433,14 +460,14 @@ void RIT_IRQHandler() noexcept
         		// got start bit
 				if (++SUBitCnt >= 0)
 				{
-					Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
+					Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod + SUOffset);
         			SUBitCnt = 0;
         			SUData = 0;
 				}
       		}
 			else
 			{
-				SUBitCnt = -2;
+				SUReadCnt = 0;
 			}
 			
     	}
@@ -448,8 +475,8 @@ void RIT_IRQHandler() noexcept
 		{
 			// stop bit read, add data to buffer
 			*SUReadPtr++ =  static_cast<uint8_t>(SUData);
-			Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod/SU_OVERSAMPLE);
-      		SUBitCnt = -2;
+			//Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod/SU_OVERSAMPLE);
+      		SUBitCnt = -1;
 			if (--SUReadCnt <= 0)
 			{
 				SUComplete = 1;
@@ -464,7 +491,7 @@ void RIT_IRQHandler() noexcept
       		SUBitCnt++;
 		}
     }
-	digitalWrite(P3_25, 0);
+	//digitalWrite(P3_25, 0);
 }
 
 
@@ -481,6 +508,7 @@ static void LPCSoftUARTAbort() noexcept
 static void LPCSoftUARTStartTransfer(uint8_t driver, volatile uint8_t *WritePtr, uint32_t WriteCnt, volatile uint8_t *ReadPtr, uint32_t ReadCnt) noexcept
 {
 	LPCSoftUARTAbort();
+	LPC_RITIMER->COUNTER   = 0;
 	Chip_RIT_SetCOMPVAL(LPC_RITIMER, SUPeriod);
 	SUWritePtr = WritePtr;
 	SUReadPtr = ReadPtr;
@@ -488,6 +516,8 @@ static void LPCSoftUARTStartTransfer(uint8_t driver, volatile uint8_t *WritePtr,
 	SUData = (static_cast<uint32_t>(*SUWritePtr) << 1) | 0x200;
 	SUWritePtr++;
 	SUBitCnt = 0;
+	SUSync = 1;
+	SUOffset = 0;
 	SUPin = TMC_UART_PINS[driver];
 	if (SUPin != NoPin)
 	{
@@ -974,10 +1004,10 @@ void TmcDriverState::AppendDriverStatus(const StringRef& reply) noexcept
 	{
 		reply.cat(" ok");
 	}
-	reply.catf( ", CRC errors %u", crcErrors);
+	reply.catf( ", CRC %u SUErrors %u", crcErrors, SUErrors);
 	reply.catf(", read errors %u, write errors %u, ifcount %u, reads %u, timeouts %u", readErrors, writeErrors, lastIfCount, numReads, numTimeouts);
 	readErrors = writeErrors = numReads = numTimeouts = 0;
-	crcErrors = 0;
+	crcErrors = 0; SUErrors = 0;
 }
 
 uint8_t static calcCRC(volatile uint8_t *datagram, uint8_t len) {

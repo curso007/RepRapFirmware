@@ -79,6 +79,9 @@ static const boardConfigEntry_t boardConfigs[]=
     
     {"lpc.adcEnablePreFilter", &ADCEnablePreFilter, nullptr, cvBoolType},
     
+#if LPC_TMC_SOFT_UART
+    {"stepper.TmcUartPins", TMC_UART_PINS, &MaxTotalDrivers, cvPinType},
+#endif
 };
 
 

@@ -116,7 +116,7 @@ extern Pin DIRECTION_PINS[NumDirectDrivers];
     extern Pin TMC_UART_PINS[NumDirectDrivers];
     constexpr Pin GlobalTmc22xxEnablePin = NoPin;			// The pin that drives ENN of all drivers
     constexpr uint32_t DriversBaudRate = 9600;
-    constexpr uint32_t TransferTimeout = 100;				// any transfer should complete within 10 ticks @ 1ms/tick
+    constexpr uint32_t TransferTimeout = 100;				// any transfer should complete within 100 ticks @ 1ms/tick
 
 #endif
 
